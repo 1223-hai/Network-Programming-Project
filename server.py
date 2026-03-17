@@ -1,222 +1,230 @@
-import socket       
-import struct        
-import time          
+import socket
+import struct
+import time
 
-PORT = 8888            
-GOOGLE_DNS = "8.8.8.8" 
-DNS_PORT = 53          
-BUF_SIZE = 2048        
+# ==============================
+# CẤU HÌNH SERVER
+# ==============================
+PORT = 8888
+GOOGLE_DNS = "8.8.8.8"
+DNS_PORT = 53
+BUF_SIZE = 2048
 
+# Cache dạng:
+# (domain, type) -> { ip, expire, is_nx }
 dns_cache = {}
 
+
+# ==============================
+# HIỂN THỊ GIAO DIỆN CLI
+# ==============================
+def print_banner():
+    print("="*55)
+    print("        DNS RESOLVER SERVER (UDP)")
+    print("   Hỗ trợ: A (IPv4), AAAA (IPv6)")
+    print("   Lệnh: /cache để xem cache")
+    print("="*55)
+
+
+# ==============================
 # CHUYỂN DOMAIN → DNS FORMAT
+# ==============================
 def format_dns_name(domain):
     qname = b''
+    for part in domain.split('.'):
+        qname += bytes([len(part)]) + part.encode()
+    return qname + b'\x00'
 
-    for part in domain.split('.'): # tách domain theo dấu chấm
-        qname += bytes([len(part)]) + part.encode()  # thêm độ dài + nội dung
 
-
-    return qname + b'\x00'  # kết thúc bằng byte 0
-
-# BỎ QUA TRƯỜNG NAME TRONG DNS
-# (do DNS có thể dùng pointer nén)
+# ==============================
+# BỎ QUA NAME (xử lý pointer DNS)
+# ==============================
 def skip_name(response, offset):
     while True:
-        length = response[offset]   # đọc byte đầu
+        length = response[offset]
 
         if length == 0:
-            # kết thúc chuỗi domain
             return offset + 1
 
         elif (length & 0xC0) == 0xC0:
-            # nếu là pointer (2 byte)
             return offset + 2
 
         else:
-            # nếu là label thường → nhảy qua
             offset += length + 1
 
-# HÀM RESOLVE DNS
-def resolve_dns(domain, qtype=1):
-    now = time.time()   # lấy thời gian hiện tại
 
-    # ===== KIỂM TRA CACHE =====
-    if domain in dns_cache:
-        entry = dns_cache[domain]
+# ==============================
+# HIỂN THỊ CACHE
+# ==============================
+def handle_cache_command():
+    now = time.time()
+    result = "\n--- CURRENT DNS CACHE ---\n"
 
-        # nếu chưa hết hạn
+    if not dns_cache:
+        return result + "Cache is empty.\n"
+
+    for key, entry in list(dns_cache.items()):
+        domain, rtype = key
+        ttl = int(entry['expire'] - now)
+
+        if ttl > 0:
+            status = "NXDOMAIN" if entry['is_nx'] else entry['ip']
+            result += f"{domain} [{rtype}] -> {status} | TTL: {ttl}s\n"
+        else:
+            del dns_cache[key]  # xóa cache hết hạn
+
+    return result + "-------------------------\n"
+
+
+# ==============================
+# HÀM RESOLVE DNS (CORE)
+# ==============================
+def resolve_dns(domain, rtype="A"):
+    now = time.time()
+    cache_key = (domain, rtype)
+
+    # ===== 1. KIỂM TRA CACHE =====
+    if cache_key in dns_cache:
+        entry = dns_cache[cache_key]
+
         if now < entry['expire']:
             ttl = int(entry['expire'] - now)
 
-            # nếu là NXDOMAIN
             if entry['is_nx']:
                 return f"Error: NXDOMAIN '{domain}'\nSource: cache\nTTL: {ttl}s\n"
 
-            # trả kết quả từ cache
-            return f"{domain} -> {entry['ip']}\nSource: cache\nTTL: {ttl}s\n"
+            return f"{domain} ({rtype}) -> {entry['ip']}\nSource: cache\nTTL: {ttl}s\n"
 
-    # ===== TẠO DNS QUERY =====
+    # ===== 2. GỬI DNS QUERY =====
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # AF_INET: IPv4
-        # SOCK_DGRAM: UDP
+        sock.settimeout(3)
 
-        sock.settimeout(3.0)  # timeout 3 giây
+        # Header DNS (12 byte)
+        header = struct.pack("!HHHHHH",
+                             1234,   # ID
+                             0x0100, # Query chuẩn
+                             1,      # 1 câu hỏi
+                             0, 0, 0)
 
-        # ===== HEADER DNS (12 byte) =====
-        header = struct.pack(
-            "!HHHHHH",
-            1234,   # ID: mã request
-            0x0100, # Flags: query chuẩn
-            1,      # QDCOUNT: 1 câu hỏi
-            0, 0, 0 # AN, NS, AR = 0
-        )
-
-        # chuyển domain sang format DNS
         qname = format_dns_name(domain)
 
-        # QTYPE: 1 = A (IPv4), 28 = AAAA (IPv6)
-        # QCLASS: 1 = IN (Internet)
+        # A = 1, AAAA = 28
+        qtype = 28 if rtype == "AAAA" else 1
         qinfo = struct.pack("!HH", qtype, 1)
 
-        # gộp header + question
         query = header + qname + qinfo
 
-        # gửi tới DNS server
         sock.sendto(query, (GOOGLE_DNS, DNS_PORT))
-
-        # nhận response
         response, _ = sock.recvfrom(BUF_SIZE)
 
         sock.close()
 
-    except socket.error:
-        return "Error: Timeout\n"
+    except:
+        return "Error: Không kết nối được DNS server\n"
 
-    # lấy 12 byte đầu
+    # ===== 3. PARSE RESPONSE =====
     _, flags, _, ans_count, _, _ = struct.unpack("!HHHHHH", response[:12])
-
-    # lấy mã lỗi (4 bit cuối)
     rcode = flags & 0x000F
 
-    # ===== XỬ LÝ NXDOMAIN =====
+    # ===== NXDOMAIN =====
     if rcode == 3:
-        # lưu cache lỗi
-        dns_cache[domain] = {
+        dns_cache[cache_key] = {
             'ip': '',
             'expire': now + 60,
             'is_nx': True
         }
-
         return f"Error: NXDOMAIN '{domain}'\n"
 
-    # ===== NẾU CÓ ANSWER =====
+    # ===== CÓ ANSWER =====
     if ans_count > 0:
-
-        # bỏ qua phần question
         offset = skip_name(response, 12) + 4
 
-        # duyệt từng answer
         for _ in range(ans_count):
-
-            # bỏ qua tên
             offset = skip_name(response, offset)
 
-            # đọc TYPE, CLASS, TTL, RDLENGTH
             atype, _, ttl, rdlength = struct.unpack(
                 "!HHIH", response[offset:offset+10])
 
             offset += 10
 
-            # ===== A RECORD (IPv4) =====
-            if atype == 1 and qtype == 1:
+            # ===== IPv4 =====
+            if atype == 1 and rtype == "A":
                 ip = socket.inet_ntoa(response[offset:offset+4])
-                # inet_ntoa: convert bytes → IP string
 
-                # lưu cache
-                dns_cache[domain] = {
+                dns_cache[cache_key] = {
                     'ip': ip,
                     'expire': now + ttl,
                     'is_nx': False
                 }
-                return f"{domain} -> {ip}\nSource: fresh\nTTL: {ttl}s\n"
-            # ===== AAAA RECORD (IPv6) =====
-            elif atype == 28 and qtype == 28:
+
+                return f"{domain} (A) -> {ip}\nSource: fresh\nTTL: {ttl}s\n"
+
+            # ===== IPv6 =====
+            elif atype == 28 and rtype == "AAAA":
                 ip = socket.inet_ntop(socket.AF_INET6,
                                       response[offset:offset+16])
-                # inet_ntop: convert IPv6 bytes → string
-                dns_cache[domain] = {
+
+                dns_cache[cache_key] = {
                     'ip': ip,
                     'expire': now + ttl,
                     'is_nx': False
                 }
-                return f"{domain} -> {ip}\nSource: fresh\nTTL: {ttl}s\n"
-            # nếu không phải A/AAAA → bỏ qua
-            offset += rdlength
-        return "Error: No answer\n"
-    return "Error: Empty response\n"
 
-# HIỂN THỊ CACHE
-def show_cache():
-    now = time.time()
-    result = "Cached entries:\n"
-    for d, v in dns_cache.items():
-        ttl = int(v['expire'] - now)
-        if ttl < 0:
-            continue
-        if v['is_nx']:
-            result += f"{d} -> NXDOMAIN | TTL: {ttl}s\n"
-        else:
-            result += f"{d} -> {v['ip']} | TTL: {ttl}s\n"
-    return result
+                return f"{domain} (AAAA) -> {ip}\nSource: fresh\nTTL: {ttl}s\n"
+
+            else:
+                offset += rdlength
+
+        return f"Error: Không có bản ghi {rtype}\n"
+
+    return "Error: Response rỗng\n"
 
 
-# MAIN SERVER UDP
+# ==============================
+# MAIN SERVER
+# ==============================
 def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    # bind server vào tất cả IP local, port 8888
     server_sock.bind(('0.0.0.0', PORT))
 
-    print(f"DNS Resolver chạy port {PORT}")
+    print_banner()
+    print(f"[INFO] Server chạy tại port {PORT}\n")
 
     while True:
-        # nhận dữ liệu từ client
         data, addr = server_sock.recvfrom(BUF_SIZE)
+        req = data.decode().strip()
 
-        # decode message
-        msg = data.decode().strip()
-
-        if not msg:
+        if not req:
             continue
 
-        # lệnh xem cache
-        if msg == "/cache":
-            response = show_cache()
+        print("\n" + "-"*55)
+        print(f"[CLIENT] {addr}")
+        print(f"[REQUEST] {req}")
+
+        # ===== XỬ LÝ =====
+        if req == "/cache":
+            response = handle_cache_command()
+
         else:
-            parts = msg.split()
+            parts = req.split()
+            domain = parts[0]
+            rtype = parts[1].upper() if len(parts) > 1 else "A"
 
-            # kiểm tra format đúng: resolve domain
-            if len(parts) < 2 or parts[0] != "resolve":
-                response = "Use: resolve <domain> [AAAA]\n"
+            if rtype not in ["A", "AAAA"]:
+                response = "Error: chỉ hỗ trợ A hoặc AAAA\n"
             else:
-                domain = parts[1]
+                print(f"[ACTION] Resolve {domain} ({rtype})")
+                response = resolve_dns(domain, rtype)
 
-                # mặc định IPv4
-                qtype = 1
+        print(f"[RESPONSE]\n{response.strip()}")
+        print("-"*55)
 
-                # nếu có AAAA → IPv6
-                if len(parts) == 3 and parts[2] == "AAAA":
-                    qtype = 28
-
-                # gọi hàm resolve
-                response = resolve_dns(domain, qtype)
-
-        # gửi kết quả về client
         server_sock.sendto(response.encode(), addr)
 
 
-# chạy server
+# ==============================
+# CHẠY SERVER
+# ==============================
 if __name__ == "__main__":
     main()
